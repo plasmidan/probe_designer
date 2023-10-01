@@ -1,9 +1,7 @@
 import gzip 
 from Bio import Entrez
-import re
 import string
 from ftplib import FTP
-import os
 import gzip
 import shutil
 import pandas as pd
