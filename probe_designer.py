@@ -7,6 +7,8 @@ import ast
 import pandas as pd
 
 
+### This is a demonstration
+
 def design_probes(genomes_dir,accession_list,output_dir,run_name,probe_props=None,max_nonspecific_match=18,selection_method='dp',is_allow_duplicates=True,min_pid=95, min_len_similarity_percent=90, min_percent_cov=90):
     """
     genomes_dir: where to find the sequences
