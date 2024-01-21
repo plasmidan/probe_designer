@@ -6,11 +6,14 @@ import csv
 import ast
 import pandas as pd
 
+import lsf_manager
+
 
 def findSpecificProbes(genome_database_dir: str, probes_dir: str, accessions: list, run_name: str, 
                  probe_props: {'probe_len': 30,'gc_min': 40,'gc_max': 65,'max_base_rep': 4},
                  max_nonspecific_match: int = 18, is_allow_gene_duplicates: bool = True,
-                 min_duplicate_pid: int = 95, min_duplicate_len_similarity_per: int = 90, min_duplicate_percent_cov: int = 90) -> None:
+                 min_duplicate_pid: int = 95, min_duplicate_len_similarity_per: int = 90, min_duplicate_percent_cov: int = 90,
+                 is_parallel=False,chunk_size=500000,is_overwrite=False,lsf_scripts_dir = '') -> None:
     
     """
     genome_database_dir: where the downloaded genome directories are kept
@@ -34,7 +37,7 @@ def findSpecificProbes(genome_database_dir: str, probes_dir: str, accessions: li
     """
 
     #open a new dir?
-    print('Designing probes...')
+    
     run_dir = rf'{probes_dir}/{run_name}'
     os.makedirs(probes_dir, exist_ok=True)
     os.makedirs(run_dir, exist_ok=True)
@@ -43,16 +46,42 @@ def findSpecificProbes(genome_database_dir: str, probes_dir: str, accessions: li
     
     runMakeBlastDb(fna_db, 'nucl', 'merged_genes')
 
-    print(' - generate naive probes')
-    generateNaiveProbes(run_dir, probe_props)
-    
-    print(' - blasting naive probes')
-    blastNaiveProbesBlast(run_dir, word_size=max_nonspecific_match)
 
-    duplicated_genes_db = identifyDuplicateGenes(run_dir, min_pid=min_duplicate_pid, min_len_similarity_percent=min_duplicate_len_similarity_per, min_percent_cov=min_duplicate_percent_cov)
+
     
-    print(' - determining probe specificities')
-    identifySpecificProbes(run_dir, duplicated_genes_db, max_nonspecific_match=max_nonspecific_match,is_allow_gene_duplicates=is_allow_gene_duplicates)
+    if not is_parallel:
+        print('Designing probes...')
+
+        print(' - finding gene duplicates')
+        duplicated_genes_db = identifyDuplicateGenes(run_dir, min_pid=min_duplicate_pid, min_len_similarity_percent=min_duplicate_len_similarity_per, min_percent_cov=min_duplicate_percent_cov)
+        
+        print(' - generate naive probes')
+        generateNaiveProbes(run_dir, probe_props)
+        
+        print(' - blasting naive probes')
+        blastNaiveProbes(run_dir, word_size=max_nonspecific_match)
+        
+        print(' - determining probe specificities')
+        identifySpecificProbes(run_dir, max_nonspecific_match=max_nonspecific_match,is_allow_gene_duplicates=is_allow_gene_duplicates)
+    else:
+        print('Designing probes (parallel mode)...')
+        lsf_man = lsf_manager.lsf_manager(run_dir=run_dir,lsf_scripts_dir=lsf_scripts_dir)
+        
+        print(' - finding gene duplicates')
+        duplicated_genes_db = identifyDuplicateGenesParallel(run_dir, min_pid=min_duplicate_pid, min_len_similarity_percent=min_duplicate_len_similarity_per, min_percent_cov=min_duplicate_percent_cov,chunk_size=1000,lsf_manager=lsf_man)
+
+        print(' - generate naive probes')
+        generateNaiveProbesParallel(run_dir, probe_props,lsf_manager=lsf_man)
+        
+        print(' - blasting naive probes')
+        blastNaiveProbesParallel(run_dir, word_size=max_nonspecific_match,chunk_size=chunk_size,is_overwrite=is_overwrite,lsf_manager=lsf_man)
+        
+        print(' - determining probe specificities')
+        identifySpecificProbesParallel(run_dir, duplicated_genes_db, max_nonspecific_match=max_nonspecific_match,is_allow_gene_duplicates=is_allow_gene_duplicates,is_overwrite=is_overwrite,lsf_manager=lsf_man)
+
+        return
+
+    
 
     return None
 
@@ -165,7 +194,8 @@ def collectGenomesForProbeDesign(genome_database_dir: str, assembly_dict: dict, 
                                 h = f.readline()
                                 s = f.readline()
                                 if not h:
-                                    break       
+                                    break
+                                #save
                                 o.write(h)
                                 o.write(s)
                                     
@@ -180,17 +210,25 @@ def collectGenomesForProbeDesign(genome_database_dir: str, assembly_dict: dict, 
 
 
 def readFastaFile(fasta_file: str) -> dict:
-    """Opens and reads fasta file to dictionary line by line."""
+    """Opens and reads fasta file (assumes one sequence in 1 line) to dictionary"""
     db = {}
-    current_header = ''
     with open(fasta_file, 'r') as fa:
         for line in fa:
             if re.search('^>', line):
-                current_header = line.rstrip()
-                db[current_header] = ''
-            else:
-                db[current_header] += line.rstrip()
+                header = line.rstrip()
+                sequence = fa.readline().rstrip()
+                db[header] = sequence
     return db
+
+
+def filter_fasta_file(fasta_db: dict, genes_to_keep: list):
+    """" keep only headers of interest"""
+    filtered_db = {}
+    for h,s in fasta_db.items():
+        if h in genes_to_keep:
+            filtered_db[h] = s
+    return filtered_db
+
 
 
 def calculateProbeGCContent(probe_seq: str) -> float:
@@ -212,68 +250,63 @@ def calculateProbeGCContent(probe_seq: str) -> float:
     return probe_gc_content
 
 
-def generateNaiveProbes(run_dir: str, probe_props: dict):
-    """Produce all possible probes with sliding window approach."""
+def identifyDuplicateGenesParallel(run_dir: str, min_pid: int = 95, min_len_similarity_percent: int = 90,min_percent_cov: int = 90,chunk_size=1000,lsf_manager=None) -> dict:
+    """"""""
+    lsf_dir_path = fr'{run_dir}/lsf'
 
-    fna_db = readFastaFile(rf'{run_dir}/merged_genes.fna')
-    naive_probes_path = rf'{run_dir}/naive_probes.fna'
+    #divide into gene sets
+    fna_db = readFastaFile(rf'{run_dir}/merged_genes.fna')  
+    fasta_headers = list(fna_db.keys())
+    header_chunk_list = [fasta_headers[i:i + chunk_size] for i in range(0, len(fasta_headers), chunk_size)] #list of gene_lists
 
-    probe_len, gc_min, gc_max, max_base_rep = int(probe_props['probe_len']), int(probe_props['gc_min']),\
-        int(probe_props['gc_max']), int(probe_props['max_base_rep'])
+    for chunk_idx,chunk_headers in enumerate(header_chunk_list):
+        with open(rf'{lsf_dir_path}/chunk_{chunk_idx}_duplicates','w') as o:
+            for h in chunk_headers:
+                s = fna_db[h]
+                o.write(f'{h}\n{s}\n')
+        lsf_manager.identifyDuplicateGenes(run_dir=run_dir, min_pid=min_pid, min_len_similarity_percent=min_len_similarity_percent,min_percent_cov=min_percent_cov,chunk_idx=chunk_idx)
 
-    with open(naive_probes_path, 'w') as probes_out_fh:
-        for header, gene_seq in fna_db.items():
-            header = re.sub('>', '', header)
-            locus_tag, contig, assembly = header.split(';')
-
-            for i in range(len(gene_seq)-probe_len):
-                # run over gene sequence, base by base and test each potential probe
-                sub_seq = str(gene_seq[i:i+probe_len])
-                sub_seq_gc = calculateProbeGCContent(sub_seq)
-                if gc_max >= sub_seq_gc >= gc_min:
-                    max_rep_tuple = (max_base_rep, max_base_rep, max_base_rep, max_base_rep)
-                    if not re.search("A{%s}|G{%s}|C{%s}|T{%s}" % max_rep_tuple, sub_seq):
-                        probe_fr, probe_to = str(i+1), str(i+probe_len)
-                        probe_header = f'{locus_tag};{contig};{assembly};{sub_seq_gc};{probe_fr}-{probe_to}'
-                        probes_out_fh.write(f'>{probe_header}\n{sub_seq}\n')
-    del fna_db
-    return None
-
-
-def blastNaiveProbesBlast(run_dir: str, word_size: int = 18, evalue: int = 100, n_threads: int = 4,output_format: int = 6) -> None:
-    """Run nucleotide blast on the sliding window naive probes."""
-    current_dir = os.getcwd()
-    os.chdir(run_dir)
-
-    query = './naive_probes.fna'
-    db = './merged_genes'
-    output_path = './naive_probes.blast_results'
-
-    cmd = f'blastn -query {query} -db {db} -word_size {word_size} -evalue {evalue} -outfmt {output_format}' \
-          f' -out {output_path} -num_threads {n_threads}'
-
-    subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-
-    os.chdir(current_dir)
-    return None
+    lsf_manager.wait_for_all_jobs_to_finish()
+    
+    duplicated_genes_db = {} #save to file and keep as handy dictionary
+    with open(rf'{run_dir}/duplicated_genes.txt','w') as o:
+        for chunk_idx,chunk_headers in enumerate(header_chunk_list):
+            with open(rf'{lsf_dir_path}/chunk_{chunk_idx}_duplicates.txt','r') as f:
+                for line in f:
+                    o.write(line)
+                    gene,hits = line.rstrip().split('\t')
+                    duplicated_genes_db[gene] = ast.literal_eval(hits)
+    
+    return duplicated_genes_db
 
 
-def identifyDuplicateGenes(run_dir: str, min_pid: int = 95, min_len_similarity_percent: int = 90,min_percent_cov: int = 90) -> dict:
+def identifyDuplicateGenes(run_dir: str, min_pid: int = 95, min_len_similarity_percent: int = 90,min_percent_cov: int = 90,chunk_idx=None) -> dict:
+
     """Find the potentially duplicated gene
         - similar length and nearly identical sequence across the majority of the genes
         - cross species duplicates are not allowed (always treated as different genes)
     """
     current_dir = os.getcwd()
     os.chdir(run_dir)
+
+    if chunk_idx is None:
+        os.makedirs('./blast_results',exist_ok=True)
+        query = r'merged_genes.fna'
+        blast_ouput_path = rf'./blast_results/gene_duplicate_identification.blast_res'
+        final_output_path = rf'./duplicated_genes.txt'
+    else:
+        query = rf'./lsf/chunk_{chunk_idx}_duplicates'
+        blast_ouput_path = rf'./lsf/chunk_{chunk_idx}_duplicates.blast_res'
+        final_output_path = rf'./lsf/chunk_{chunk_idx}_duplicates.txt'
+
     fasta_db = readFastaFile(rf'{run_dir}/merged_genes.fna')
-    self_blast_path = r'gene_duplicate_identification.blast_res'
-    query = r'merged_genes.fna'
+    
     db = r'merged_genes'
-    cmd = f'blastn -query {query} -db {db} -word_size 28 -evalue 100 -outfmt 6 -out {self_blast_path}'
+    cmd = f'blastn -query {query} -db {db} -word_size 28 -evalue 1000 -outfmt 6 -out {blast_ouput_path}'
     subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
 
     duplicated_genes_db = {}
-    with open(self_blast_path, 'r') as blast_res_fh:
+    with open(blast_ouput_path, 'r') as blast_res_fh:
         for line in blast_res_fh:
             query_gene_header, hit_gene_header, pid, match_len, mismatches, gap_len, q_start, q_end, h_start, h_end,evalue, bitscore = line.rstrip().split('\t')
 
@@ -309,19 +342,157 @@ def identifyDuplicateGenes(run_dir: str, min_pid: int = 95, min_len_similarity_p
                 else:
                     duplicated_genes_db[query_gene_header].append(hit_gene_header)
 
-    with open('./duplicated_genes.txt', 'w') as f:
+    with open(final_output_path, 'w') as f:
         for k, v in duplicated_genes_db.items():
             f.write(f'{k}\t{v}\n')
     os.chdir(current_dir)
     return duplicated_genes_db
 
 
-def identifySpecificProbes(run_dir: str, duplicated_genes_db: dict, max_nonspecific_match: int = 18,is_allow_gene_duplicates: bool = True) -> None:
-    """Keeps specific probes from all naive sliding window probes."""
+
+def generateNaiveProbesParallel(run_dir: str, probe_props,chunk_size = 2000,lsf_manager=None):
+    """" run on wexac
+    - divide into multiple jobs, generating naive probes for different gene sets
+    - merge the results into a single file
+    """
     
-    naive_probe_fasta_db = readFastaFile(rf'{run_dir}/naive_probes.fna')
+    fna_db = readFastaFile(rf'{run_dir}/merged_genes.fna')  
+    fasta_headers = list(fna_db.keys())
+    header_chunk_list = [fasta_headers[i:i + chunk_size] for i in range(0, len(fasta_headers), chunk_size)]
+
+    #open a directory for storing the chunks
+    lsf_dir_path = fr'{run_dir}/lsf'
+
+    #{'probe_len': 30,'gc_min': 40,'gc_max': 65,'max_base_rep': 4}
+    probe_len = probe_props['probe_len']
+    gc_min = probe_props['gc_min']
+    gc_max = probe_props['gc_max']
+    max_base_rep = probe_props['max_base_rep']
+	
+    for chunk_idx,chunks in enumerate(header_chunk_list):
+        lsf_manager.generateNaiveProbes(run_dir,chunk_size=chunk_size,chunk_idx=chunk_idx,probe_len=probe_len,gc_min=gc_min,gc_max=gc_max,max_base_rep=max_base_rep)
+    
+    lsf_manager.wait_for_all_jobs_to_finish()
+    
+    #merge results
+    with open(fr'{run_dir}/naive_probes.fna','w') as o:
+        for chunk_idx,chunks in enumerate(header_chunk_list):
+            chunk_path = fr'{lsf_dir_path}/naive_probes_chunk_{chunk_idx}'
+            with open(chunk_path) as f:
+                for line in f:
+                    o.write(line)
+            os.remove(chunk_path)
+    return
+
+
+def generateNaiveProbes(run_dir: str, probe_props: dict,genes_in_chunk: list = None,chunk_idx:int = None):
+    """Produce all possible probes with sliding window approach."""
+
+    fna_db = readFastaFile(rf'{run_dir}/merged_genes.fna')
+    
+    # if running on chunks, filter for the selected genes 
+    if genes_in_chunk is not None:
+        fna_db = filter_fasta_file(fasta_db=fna_db, genes_to_keep=genes_in_chunk)
+        naive_probes_path = rf'{run_dir}/lsf/naive_probes_chunk_{chunk_idx}'
+    else:
+        naive_probes_path = rf'{run_dir}/naive_probes.fna'
+
+    
+    if os.path.exists(naive_probes_path):
+        print(naive_probes_path)
+        print('naive probes found...')
+        return
+
+    probe_len, gc_min, gc_max, max_base_rep = int(probe_props['probe_len']), int(probe_props['gc_min']),\
+        int(probe_props['gc_max']), int(probe_props['max_base_rep'])
+
+    with open(naive_probes_path, 'w') as probes_out_fh:
+        for header, gene_seq in fna_db.items():
+            header = re.sub('>', '', header)
+            locus_tag, contig, assembly = header.split(';')
+
+            for i in range(len(gene_seq)-probe_len):
+                # run over gene sequence, base by base and test each potential probe
+                sub_seq = str(gene_seq[i:i+probe_len])
+                sub_seq_gc = calculateProbeGCContent(sub_seq)
+                if gc_max >= sub_seq_gc >= gc_min:
+                    max_rep_tuple = (max_base_rep, max_base_rep, max_base_rep, max_base_rep)
+                    if not re.search("A{%s}|G{%s}|C{%s}|T{%s}" % max_rep_tuple, sub_seq):
+                        probe_fr, probe_to = str(i+1), str(i+probe_len)
+                        probe_header = f'{locus_tag};{contig};{assembly};{sub_seq_gc};{probe_fr}-{probe_to}'
+                        probes_out_fh.write(f'>{probe_header}\n{sub_seq}\n')
+    del fna_db
+    return None
+
+
+def blastNaiveProbes(run_dir: str, word_size: int = 18, evalue: int = 1000, n_threads: int = 4,output_format: int = 6):
+    """Run nucleotide blast on the sliding window naive probes."""
+    current_dir = os.getcwd()
+    os.chdir(run_dir)
+    query = './naive_probes.fna'
+    db = './merged_genes'
+    output_path = './blast_results/naive_probes.blast_results'
+    cmd = f'blastn -query {query} -db {db} -word_size {word_size} -evalue {evalue} -outfmt {output_format} -out {output_path} -num_threads {n_threads}'
+    subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+    os.chdir(current_dir)
+    return 
+
+def blastNaiveProbesParallel(run_dir: str, word_size: int = 18, evalue: int = 100, n_threads: int = 4,output_format: int = 6,chunk_size=100000,is_overwrite=False,lsf_manager=None):
+        
+    """" run on wexac
+        - divides naive probes into chunks
+        - blast chunks in parallel against the merged fasta database
+        - does not merge the results -> they are each processed individually next
+    """
+    #open a directory for storing the chunks
+    lsf_dir_path = fr'{run_dir}/lsf'
+    
+    #divide naive probes into chunks
+    naive_probes_path = rf'{run_dir}/naive_probes.fna'
+    cmd_str = f'split -d -a 5 -l {chunk_size} {naive_probes_path} {lsf_dir_path}/pchunk_'
+    cmd = subprocess.Popen(cmd_str, stdout=subprocess.PIPE, shell=True).communicate()
+
+    #submit each chunk as a blast job	
+    chunk_list = [x for x in os.listdir(lsf_dir_path) if re.search('^pchunk_\d+$',x)]
+    for chunk_name in chunk_list:
+        
+        #submit job for chunk
+        output_path = f'{lsf_dir_path}/{chunk_name}.blast_res'
+        if os.path.exists(output_path) and not is_overwrite:
+            continue
+        else:
+            lsf_manager.blastNaiveProbes(run_dir,word_size=word_size,chunk_name=chunk_name)
+
+    lsf_manager.wait_for_all_jobs_to_finish()
+
+    return
+ 
+
+
+
+def identifySpecificProbes(run_dir: str, max_nonspecific_match: int = 18,is_allow_gene_duplicates: bool = True,is_parallel=False,chunk_name='') -> None:
+    """Keeps specific probes from all naive sliding window probes."""
+    #duplicated_genes_db: dict    
+    duplicated_genes_db = {}
+    with open(rf'{run_dir}/duplicated_genes.txt','r') as f:
+        for line in f:
+            gene,hits = line.rstrip().split('\t')
+            duplicated_genes_db[gene] = ast.literal_eval(hits)
+
+    #define file names for local or lsf run
+    if not is_parallel:
+        naive_probe_fasta_path = rf'{run_dir}/naive_probes.fna'
+        blast_resuls_path = rf'{run_dir}/blast_results/naive_probes.blast_results'
+        output_file_path = fr'{run_dir}/all_specific_probes.txt'
+    else:
+        naive_probe_fasta_path = rf'{run_dir}/lsf/{chunk_name}'
+        blast_resuls_path = rf'{run_dir}/lsf/{chunk_name}.blast_res'
+        output_file_path = fr'{run_dir}/lsf/{chunk_name}.specific_probes.txt'
+        max_nonspecific_match = int(max_nonspecific_match)
+
+    naive_probe_fasta_db = readFastaFile(naive_probe_fasta_path)
     probe_result_db = {}
-    with open(rf'{run_dir}/naive_probes.blast_results', 'r') as f:
+    with open(blast_resuls_path, 'r') as f:
         for line in f:  # BSU_00010;NC_000964.3;ASM904v1;40.0;6-35
             probe_header, hit_header, pid, match_len, mismatches, gap_len, q_start, q_end, h_start, h_end, evalue, bitscore = line.rstrip().split('\t')
             probe_locus, probe_contig, probe_assembly, probe_gc, probe_fr_to = probe_header.split(';')
@@ -361,7 +532,7 @@ def identifySpecificProbes(run_dir: str, duplicated_genes_db: dict, max_nonspeci
                     probe_result_db[probe_header]['all_non_specific_hits'].append(hit_header)
     
     # save the specific probes
-    with open(fr'{run_dir}/all_specific_probes.txt', 'w') as o:
+    with open(output_file_path, 'w') as o:
         for probe_header in probe_result_db:
             number_of_non_specific_hits = probe_result_db[probe_header]['number_of_non_specific_hits']
             # if probe is completely specific
@@ -375,6 +546,36 @@ def identifySpecificProbes(run_dir: str, duplicated_genes_db: dict, max_nonspeci
                 line = '\t'.join([probe_assembly, probe_locus, probe_fr, probe_to, probe_gc, probe_seq])
                 o.write(line + '\n')
     return None
+
+
+
+
+
+
+def identifySpecificProbesParallel(run_dir: str, duplicated_genes_db: dict, max_nonspecific_match: int = 18,is_allow_gene_duplicates: bool = True,is_overwrite=False,lsf_manager=None):
+    """" run on wexac
+        - uses the chunk blast results and generates chunk specific probes
+        - merge the results into a single file
+    """
+    #open a directory for storing the chunks
+    lsf_dir_path = fr'{run_dir}/lsf'
+	
+    # get all files, for each write a job.sh file, submit range:
+    chunk_list = [x for x in os.listdir(lsf_dir_path) if re.search('^pchunk_\d+$',x)]
+    for chunk_name in chunk_list:
+        #use lsf manager to send the job
+        lsf_manager.identifySpecificProbes(run_dir,chunk_name,max_nonspecific_match,is_allow_gene_duplicates)
+    
+    lsf_manager.wait_for_all_jobs_to_finish()
+    
+    #merge results
+    with open(fr'{run_dir}/all_specific_probes.txt','w') as o:
+        for chunk_name in chunk_list:
+            with open(f'{lsf_dir_path}/{chunk_name}.specific_probes.txt') as f:
+                for line in f:
+                    o.write(line)
+    return
+
 
 
 def reverseComplement(seq: str) -> str:
@@ -449,7 +650,7 @@ def saveSelectedProbes(output_filename: str, selected_probes: dict) -> None:
 def getGeneDuplicates(run_dir: str) -> dict:
     """Handles gene duplicates."""
     try:
-        df = pd.read_csv(rf'{run_dir}\duplicated_genes.txt', sep='\t')
+        df = pd.read_csv(rf'{run_dir}/duplicated_genes.txt', sep='\t')
         df.columns = ['gene','hits']
     except:
         df = pd.DataFrame(columns=['gene', 'hits'])

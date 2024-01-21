@@ -140,7 +140,7 @@ def downloadFtpDir(accession: str, url: str, output_dir: str, download_mode: str
         output_dir = os.path.join(output_dir, output_name)
         os.makedirs(output_dir, exist_ok=True)
 
-        os.rename(assembly_report_file, f'{output_dir}/{assembly_report_file}')
+        shutil.copy(assembly_report_file, f'{output_dir}/{assembly_report_file}')
 
         for file in files:
             # If download mode is 'basic' and the file is not a basic file, skip it
@@ -275,6 +275,65 @@ def extractCdsInfo(genes_info_df,gff_file_path, output_file_path):
                         output_file.write(f'{locus_tag}\t{start_position}\t{end_position}\t{cds_count}\n')
 
 
+# def mergeAndRewriteFasta(directory: str, accession: str,is_img=False) -> None:
+#     """ Combine coding sequence and RNA to one fasta file
+#     """
+#     genes_info_path = os.path.join(directory, accession + '.genes_info.txt')
+#     genes_info = pd.read_csv(genes_info_path, sep='\t')
+#     contig = genes_info.iloc[0]['contig']
+
+#     records = []
+    
+#     cds_fasta = glob.glob(os.path.join(directory, f"*{'_cds_from_genomic.fna'}"))
+#     rna_fasta = glob.glob(os.path.join(directory, f"*{'_rna_from_genomic.fna'}"))
+
+#     if not is_img:
+#         fasta_files = [cds_fasta, rna_fasta]
+#     else:
+#         img_fasta = glob.glob(os.path.join(directory, f"*{'.genes.fna'}"))
+#         fasta_files = [img_fasta]
+
+#     for file_list in fasta_files:
+#         for file in file_list:
+#             with open(file, "r") as f:
+#                 for record in SeqIO.parse(f, "fasta"):
+#                     header_parts = record.description.split(" ")
+
+#                     if is_img:
+#                         pattern = r'\d+ (\S+) (\d+)\.\.(\d+)\(([\+\-])\)\(([^)]+)\) \[(.+)\]'
+#                         match = re.match(pattern, record.description)
+#                         locus_tag = match.group(1)
+#                     else:
+#                         try:
+#                             locus_tag = re.search(r'locus_tag=([^\]]+)', record.description).group(1)
+#                         except:
+#                             # line does not have a locus_tag and will be ignored
+#                             locus_tag = 'no_locus_tag'
+#                     # extract contig and locus_tag from header
+#                     try:
+#                         #make sure locus tag is in GFF - avoid pseudogenes
+#                         if not genes_info['locus_tag'].isin([locus_tag]).any(): 
+#                             continue
+#                     except (Exception,):
+#                         print(f'locus_tag not found in file {file}\nline: {record.description}\n')
+#                         print('error check genomic seq file for corruption...')
+#                         exit()
+#                     # Rewrite the record id as 'contig;locus_tag'
+#                     record.id = f"{locus_tag};{contig};{accession}"
+#                     record.description = ''  # Empty the description to make the fasta header clean
+#                     records.append(record)
+    
+#     output_fasta = rf'{directory}/merged_genes.fasta'
+#     with open(output_fasta, "w") as out_f:
+#         for record in records:
+#             # Create a new record with the sequence as a single string
+#             new_record = SeqRecord(Seq(str(record.seq)), id=record.id, description='')
+#             # Write the modified record to the file
+#             out_f.write(new_record.format("fasta-2line"))
+
+#     return None
+
+
 def mergeAndRewriteFasta(directory: str, accession: str,is_img=False) -> None:
     """ Combine coding sequence and RNA to one fasta file
     """
@@ -282,7 +341,7 @@ def mergeAndRewriteFasta(directory: str, accession: str,is_img=False) -> None:
     genes_info = pd.read_csv(genes_info_path, sep='\t')
     contig = genes_info.iloc[0]['contig']
 
-    records = []
+    merged_fasta_db = {}
     
     cds_fasta = glob.glob(os.path.join(directory, f"*{'_cds_from_genomic.fna'}"))
     rna_fasta = glob.glob(os.path.join(directory, f"*{'_rna_from_genomic.fna'}"))
@@ -295,16 +354,19 @@ def mergeAndRewriteFasta(directory: str, accession: str,is_img=False) -> None:
 
     for file_list in fasta_files:
         for file in file_list:
-            with open(file, "r") as f:
-                for record in SeqIO.parse(f, "fasta"):
-                    header_parts = record.description.split(" ")
+            db = readFastaFile(file)
+            for h,s in db.items():
 
-                    if is_img:
-                        pattern = r'\d+ (\S+) (\d+)\.\.(\d+)\(([\+\-])\)\(([^)]+)\) \[(.+)\]'
-                        match = re.match(pattern, record.description)
-                        locus_tag = match.group(1)
-                    else:
-                        locus_tag = re.search(r'locus_tag=([^\]]+)', record.description).group(1)
+                if is_img:
+                    pattern = r'\d+ (\S+) (\d+)\.\.(\d+)\(([\+\-])\)\(([^)]+)\) \[(.+)\]'
+                    match = re.match(pattern, h)
+                    locus_tag = match.group(1)
+                else:
+                    try:
+                        locus_tag = re.search(r'locus_tag=([^\]]+)', h).group(1)
+                    except:
+                        # line does not have a locus_tag and will be ignored
+                        locus_tag = 'no_locus_tag'
                     # extract contig and locus_tag from header
                     try:
                         #make sure locus tag is in GFF - avoid pseudogenes
@@ -315,18 +377,29 @@ def mergeAndRewriteFasta(directory: str, accession: str,is_img=False) -> None:
                         print('error check genomic seq file for corruption...')
                         exit()
                     # Rewrite the record id as 'contig;locus_tag'
-                    record.id = f"{locus_tag};{contig};{accession}"
-                    record.description = ''  # Empty the description to make the fasta header clean
-                    records.append(record)
+                    h_new = f"{locus_tag};{contig};{accession}"
+                    if h_new in merged_fasta_db:
+                        if len(s) > len(merged_fasta_db[h_new]):
+                            merged_fasta_db[h_new] = s
+                    else:
+                        merged_fasta_db[h_new] = s
     
     output_fasta = rf'{directory}/merged_genes.fasta'
     with open(output_fasta, "w") as out_f:
-        for record in records:
-            # Create a new record with the sequence as a single string
-            new_record = SeqRecord(Seq(str(record.seq)), id=record.id, description='')
-            # Write the modified record to the file
-            out_f.write(new_record.format("fasta-2line"))
-
+        for h,s in merged_fasta_db.items():
+            out_f.write(f'>{h}\n')
+            out_f.write(f'{s}\n')
     return None
 
-
+def readFastaFile(fasta_file: str) -> dict:
+    """Opens and reads fasta file to dictionary line by line."""
+    db = {}
+    current_header = ''
+    with open(fasta_file, 'r') as fa:
+        for line in fa:
+            if re.search('^>', line):
+                current_header = line.rstrip()
+                db[current_header] = ''
+            else:
+                db[current_header] += line.rstrip()
+    return db
